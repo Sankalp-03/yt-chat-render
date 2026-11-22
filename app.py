@@ -299,16 +299,24 @@ def send_kick_chat_message(access_token, broadcaster_user_id, text):
 
 
 # --- Message Selection (Checked Fresh Every Cycle) ---
-def generate_gemini_reply(recent_lines, fallbacks):
+def generate_gemini_reply(recent_lines, fallbacks, stream_context=""):
     pool = fallbacks if fallbacks else ["Great stream today!"]
-    if not recent_lines or not gemini_client:
+    if not gemini_client:
         return random.choice(pool)
 
-    prompt = (
-        "Recent messages in a live stream chat:\n"
-        + "\n".join(recent_lines)
-        + "\n\nWrite one short, natural chat message that fits the conversation."
-    )
+    if recent_lines:
+        prompt = (
+            "Recent messages in a live stream chat:\n"
+            + "\n".join(recent_lines)
+            + "\n\nWrite one short, natural chat message that fits the conversation."
+        )
+    else:
+        ctx = f" on Kick channel @{stream_context}" if stream_context else " on a live stream"
+        prompt = (
+            f"You are watching{ctx} where recent chat messages aren't available. "
+            "Write one short, natural viewer chat message reacting to the live stream."
+        )
+
     try:
         response = gemini_client.models.generate_content(
             model=MODEL_ID,
@@ -334,7 +342,7 @@ def generate_gemini_reply(recent_lines, fallbacks):
         return random.choice(pool)
 
 
-def get_live_message_for_tick(sid, platform, recent_lines=None):
+def get_live_message_for_tick(sid, platform, recent_lines=None, stream_context=""):
     key = (sid, normalize_platform(platform))
     with state_lock:
         cfg = dict(session_configs.get(key, {}))
@@ -347,7 +355,7 @@ def get_live_message_for_tick(sid, platform, recent_lines=None):
             return manual_text
         raise ValueError("Manual Chat selected, but Manual Chat Message is empty.")
 
-    return generate_gemini_reply(recent_lines or [], fallbacks)
+    return generate_gemini_reply(recent_lines or [], fallbacks, stream_context=stream_context)
 
 
 # --- Agent Loops ---
@@ -363,7 +371,7 @@ def youtube_agent_loop(video_id, interval, token_json_str, sid, stop_evt):
                 with state_lock:
                     mode = normalize_mode(session_configs.get((sid, "youtube"), {}).get("mode"))
                 recent = get_yt_recent_messages(yt, chat_id, limit=15) if mode == "gemini" else []
-                msg = get_live_message_for_tick(sid, "youtube", recent_lines=recent)
+                msg = get_live_message_for_tick(sid, "youtube", recent_lines=recent, stream_context=video_id)
                 sent_msg = send_yt_chat_message(yt, chat_id, msg)
                 add_log(f"[YT | {mode}] Sent: {sent_msg}", sid, "youtube")
             except Exception as exc:
@@ -393,7 +401,7 @@ def kick_agent_loop(slug, interval, token_json_str, sid, stop_evt):
                 current_token = get_kick_access_token(token_json_str, sid)
                 with state_lock:
                     mode = normalize_mode(session_configs.get((sid, "kick"), {}).get("mode"))
-                msg = get_live_message_for_tick(sid, "kick", recent_lines=[])
+                msg = get_live_message_for_tick(sid, "kick", recent_lines=[], stream_context=slug)
                 sent_msg = send_kick_chat_message(current_token, broadcaster_id, msg)
                 add_log(f"[Kick | {mode}] Sent to @{slug}: {sent_msg}", sid, "kick")
             except Exception as exc:

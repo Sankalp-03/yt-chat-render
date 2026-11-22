@@ -1,9 +1,11 @@
 import os
 import json
+import uuid
 import time
 import random
 import threading
 from flask import Flask, request, jsonify, redirect, session, render_template_string
+from werkzeug.middleware.proxy_fix import ProxyFix
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
@@ -13,6 +15,9 @@ from google.genai import types
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("FLASK_SECRET_KEY", "change-me-in-production")
+app.wsgi_app = ProxyFix(app.wsgi_app, x_proto=1, x_host=1)
+app.config["SESSION_COOKIE_SECURE"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"]
 MODEL_ID = "gemini-3.5-flash-lite"
@@ -22,12 +27,16 @@ CLIENT_CONFIG_JSON = os.environ.get("GOOGLE_CLIENT_CONFIG_JSON", "")
 # Allow http only when testing locally on localhost
 if os.environ.get("FLASK_ENV") == "development":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+    app.config["SESSION_COOKIE_SECURE"] = False
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 state_lock = threading.Lock()
 stop_event = threading.Event()
 worker_thread = None
+
+session_logs = {}  # {session_id: [log_lines...]}
+active_session_id = None
 
 agent_state = {
     "running": False,
@@ -38,17 +47,28 @@ agent_state = {
         "Loving the content so far!",
         "Keep it up!",
     ],
-    "youtube_token_json": "",
-    "logs": [],
 }
 
 
-def add_log(msg):
+def get_or_create_sid():
+    sid = session.get("sid")
+    if not sid:
+        sid = str(uuid.uuid4())
+        session["sid"] = sid
+    with state_lock:
+        session_logs.setdefault(sid, [])
+    return sid
+
+
+def add_log(msg, sid=None):
     stamp = time.strftime("%H:%M:%S")
     line = f"[{stamp}] {msg}"
     with state_lock:
-        agent_state["logs"].append(line)
-        agent_state["logs"] = agent_state["logs"][-100:]
+        target_sid = sid or active_session_id
+        if target_sid:
+            session_logs.setdefault(target_sid, [])
+            session_logs[target_sid].append(line)
+            session_logs[target_sid] = session_logs[target_sid][-100:]
 
 
 def url_for_callback():
@@ -73,7 +93,7 @@ def build_oauth_flow(state=None):
     )
 
 
-def get_youtube_client(token_json_str):
+def get_youtube_client(token_json_str, sid=None):
     if not token_json_str:
         raise RuntimeError("Not authenticated. Click 'Authenticate / Re-auth Google' first.")
     token_data = json.loads(token_json_str)
@@ -82,7 +102,9 @@ def get_youtube_client(token_json_str):
         creds.refresh(Request())
         refreshed_json = creds.to_json()
         with state_lock:
-            agent_state["youtube_token_json"] = refreshed_json
+            if sid:
+                session_logs.setdefault(sid, [])
+        session["youtube_token_json"] = refreshed_json
     return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
 
 
@@ -163,31 +185,31 @@ def send_chat_message(youtube, live_chat_id, text):
     ).execute()
 
 
-def agent_loop(video_id, interval, fallbacks, token_json_str):
+def agent_loop(video_id, interval, fallbacks, token_json_str, sid):
     try:
-        add_log("Authenticating with dynamic YouTube token...")
-        yt = get_youtube_client(token_json_str)
+        add_log("Authenticating with session YouTube token...", sid=sid)
+        yt = get_youtube_client(token_json_str, sid=sid)
         chat_id = get_live_chat_id(yt, video_id)
-        add_log(f"Connected to chat: {chat_id}")
+        add_log(f"Connected to chat: {chat_id}", sid=sid)
 
         while not stop_event.is_set():
             try:
                 recent = get_recent_messages(yt, chat_id, limit=15)
                 msg = generate_reply(recent, fallbacks)
                 send_chat_message(yt, chat_id, msg)
-                add_log(f"Sent: {msg}")
+                add_log(f"Sent: {msg}", sid=sid)
             except Exception as exc:
-                add_log(f"Loop error: {exc}")
+                add_log(f"Loop error: {exc}", sid=sid)
 
             wait_seconds = max(15, int(interval)) + random.randint(0, 20)
             if stop_event.wait(timeout=wait_seconds):
                 break
     except Exception as exc:
-        add_log(f"Startup error: {exc}")
+        add_log(f"Startup error: {exc}", sid=sid)
     finally:
         with state_lock:
             agent_state["running"] = False
-        add_log("Agent stopped.")
+        add_log("Agent stopped.", sid=sid)
 
 
 HTML_PAGE = """
@@ -273,7 +295,7 @@ Keep it up!</textarea>
 
       const ab = document.getElementById("authBadge");
       ab.textContent = data.authenticated
-        ? "YouTube Auth: Ready (dynamic token active)"
+        ? "YouTube Auth: Ready (session token active)"
         : "YouTube Auth: Required (click Authenticate / Re-auth Google)";
       ab.style.color = data.authenticated ? "#4ade80" : "#fbbf24";
 
@@ -292,95 +314,13 @@ Keep it up!</textarea>
 
 @app.route("/")
 def index():
+    get_or_create_sid()
     return render_template_string(HTML_PAGE)
 
 
 @app.route("/auth")
 def auth():
+    get_or_create_sid()
     flow = build_oauth_flow()
     auth_url, state = flow.authorization_url(
-        access_type="offline",
-        include_granted_scopes="true",
-        prompt="consent",
-    )
-    session["oauth_state"] = state
-    session["code_verifier"] = flow.code_verifier
-    return redirect(auth_url)
-
-
-@app.route("/oauth2callback")
-def oauth2callback():
-    state = session.get("oauth_state")
-    flow = build_oauth_flow(state=state)
-    flow.code_verifier = session.get("code_verifier")
-
-    auth_response = request.url
-    if "onrender.com" in auth_response and auth_response.startswith("http://"):
-        auth_response = "https://" + auth_response[len("http://"):]
-
-    flow.fetch_token(authorization_response=auth_response)
-    creds = flow.credentials
-    token_json = creds.to_json()
-
-    with state_lock:
-        agent_state["youtube_token_json"] = token_json
-    session["youtube_token_json"] = token_json
-    session.pop("code_verifier", None)
-    add_log("Generated new dynamic youtube_token_json via Google OAuth.")
-    return redirect("/")
-
-
-@app.route("/status")
-def status():
-    with state_lock:
-        has_token = bool(agent_state["youtube_token_json"] or session.get("youtube_token_json"))
-        return jsonify({
-            "running": agent_state["running"],
-            "authenticated": has_token,
-            "logs": list(agent_state["logs"]),
-        })
-
-
-@app.route("/start", methods=["POST"])
-def start():
-    global worker_thread
-    payload = request.get_json(force=True) or {}
-    video_id = (payload.get("video_id") or "").strip()
-    interval = int(payload.get("interval") or 300)
-    fallbacks = payload.get("fallback_messages") or []
-
-    if not video_id:
-        return jsonify({"error": "YouTube Video ID is required."}), 400
-
-    with state_lock:
-        token_json = agent_state["youtube_token_json"] or session.get("youtube_token_json", "")
-        if not token_json:
-            return jsonify({"error": "Please click 'Authenticate / Re-auth Google' first."}), 400
-        if agent_state["running"]:
-            return jsonify({"error": "Agent is already running."}), 400
-        agent_state["youtube_token_json"] = token_json
-        agent_state["video_id"] = video_id
-        agent_state["interval"] = interval
-        agent_state["fallback_messages"] = fallbacks
-        agent_state["running"] = True
-        stop_event.clear()
-
-    worker_thread = threading.Thread(
-        target=agent_loop,
-        args=(video_id, interval, fallbacks, token_json),
-        daemon=True,
-    )
-    worker_thread.start()
-    return jsonify({"ok": True})
-
-
-@app.route("/stop", methods=["POST"])
-def stop():
-    stop_event.set()
-    add_log("Stop requested...")
-    return jsonify({"ok": True})
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+        access_type

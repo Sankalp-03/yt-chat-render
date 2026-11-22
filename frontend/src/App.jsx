@@ -145,7 +145,7 @@ function App() {
             <a href="https://github.com/Sankalp-03/yt-chat-render" target="_blank" rel="noreferrer">View repository <ExternalLink size={12} /></a>
           </div>
           <a className="github-link" href="https://github.com/Sankalp-03/yt-chat-render" target="_blank" rel="noreferrer"><Github size={16} /> GitHub repository <ExternalLink size={12} /></a>
-          <div className="version">STREAM PILOT <span>·</span> LOCAL DASHBOARD</div>
+          <div className="version">STREAMHELM <span>·</span> DASHBOARD</div>
         </div>
       </aside>
 
@@ -154,7 +154,6 @@ function App() {
           <div className="breadcrumbs"><span>Workspace</span><span className="crumb-slash">/</span><strong>Dashboard</strong></div>
           <div className="topbar-right">
             <span className="secure-label"><ShieldCheck size={14} /> Session protected</span>
-            <div className="avatar">SP</div>
           </div>
         </header>
 

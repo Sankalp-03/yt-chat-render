@@ -323,4 +323,92 @@ def auth():
     get_or_create_sid()
     flow = build_oauth_flow()
     auth_url, state = flow.authorization_url(
-        access_type
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent",
+    )
+    session["oauth_state"] = state
+    session["code_verifier"] = flow.code_verifier
+    return redirect(auth_url)
+
+
+@app.route("/oauth2callback")
+def oauth2callback():
+    sid = get_or_create_sid()
+    state = session.get("oauth_state")
+    flow = build_oauth_flow(state=state)
+    flow.code_verifier = session.get("code_verifier")
+
+    auth_response = request.url
+    if "onrender.com" in auth_response and auth_response.startswith("http://"):
+        auth_response = "https://" + auth_response[len("http://"):]
+
+    flow.fetch_token(authorization_response=auth_response)
+    creds = flow.credentials
+    session["youtube_token_json"] = creds.to_json()
+    session.pop("code_verifier", None)
+    add_log("Generated new session youtube_token_json via Google OAuth.", sid=sid)
+    return redirect("/")
+
+
+@app.route("/status")
+def status():
+    sid = get_or_create_sid()
+    has_token = bool(session.get("youtube_token_json"))
+    with state_lock:
+        running = agent_state["running"]
+        logs = list(session_logs.get(sid, []))
+    return jsonify({
+        "running": running,
+        "authenticated": has_token,
+        "logs": logs,
+    })
+
+
+@app.route("/start", methods=["POST"])
+def start():
+    global worker_thread, active_session_id
+    sid = get_or_create_sid()
+    token_json = session.get("youtube_token_json", "")
+    if not token_json:
+        return jsonify({"error": "Please click 'Authenticate / Re-auth Google' first."}), 400
+
+    payload = request.get_json(force=True) or {}
+    video_id = (payload.get("video_id") or "").strip()
+    interval = int(payload.get("interval") or 300)
+    fallbacks = payload.get("fallback_messages") or []
+
+    if not video_id:
+        return jsonify({"error": "YouTube Video ID is required."}), 400
+
+    with state_lock:
+        if agent_state["running"]:
+            return jsonify({"error": "Agent is already running."}), 400
+        active_session_id = sid
+        session_logs[sid] = []
+        agent_state["video_id"] = video_id
+        agent_state["interval"] = interval
+        agent_state["fallback_messages"] = fallbacks
+        agent_state["running"] = True
+        stop_event.clear()
+
+    worker_thread = threading.Thread(
+        target=agent_loop,
+        args=(video_id, interval, fallbacks, token_json, sid),
+        daemon=True,
+    )
+    worker_thread.start()
+    return jsonify({"ok": True})
+
+
+@app.route("/stop", methods=["POST"])
+def stop():
+    sid = get_or_create_sid()
+    stop_event.set()
+    add_log("Stop requested...", sid=sid)
+    return jsonify({"ok": True})
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

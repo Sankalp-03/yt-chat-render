@@ -10,7 +10,15 @@ import random
 import threading
 from urllib.parse import urlencode
 import requests
-from flask import Flask, request, jsonify, redirect, session, render_template_string
+from flask import (
+    Flask,
+    request,
+    jsonify,
+    redirect,
+    session,
+    render_template_string,
+    send_from_directory,
+)
 from werkzeug.middleware.proxy_fix import ProxyFix
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -787,10 +795,36 @@ Keep it up!</textarea>
 """
 
 
+# --- React Frontend ---
+FRONTEND_DIST = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "frontend",
+    "dist"
+)
+
+
 @app.route("/")
 def index():
     get_or_create_sid()
-    return render_template_string(HTML_PAGE)
+
+    index_file = os.path.join(FRONTEND_DIST, "index.html")
+
+    if not os.path.exists(index_file):
+        return (
+            "React frontend build not found. "
+            "Run 'npm install' and 'npm run build' inside frontend/.",
+            500,
+        )
+
+    return send_from_directory(FRONTEND_DIST, "index.html")
+
+
+@app.route("/assets/<path:filename>")
+def frontend_assets(filename):
+    return send_from_directory(
+        os.path.join(FRONTEND_DIST, "assets"),
+        filename
+    )
 
 
 # --- YouTube OAuth Routes ---

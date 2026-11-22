@@ -497,14 +497,14 @@ HTML_PAGE = """
     </div>
 
     <label class="field-label" for="manualMsg">Manual Chat Message</label>
-    <input id="manualMsg" type="text" placeholder="Type the exact message to send in Manual Chat mode" disabled oninput="syncConfigLive()" />
+    <input id="manualMsg" type="text" placeholder="Type the exact message to send in Manual Chat mode" disabled />
     <div class="hint">Disabled when <strong>Gemini Chat</strong> is selected. When <strong>Manual Chat</strong> is selected, you can edit this text anytime and the next scheduled message will use the updated text.</div>
 
     <label class="field-label" for="interval">Interval (seconds)</label>
     <input id="interval" type="number" min="15" value="300" />
 
     <label class="field-label" for="fallbacks">Fallback Messages (used in Gemini Chat if chat is quiet or Gemini is unavailable)</label>
-    <textarea id="fallbacks" oninput="syncConfigLive()">Great stream today!
+    <textarea id="fallbacks">Great stream today!
 Loving the content so far!
 Keep it up!</textarea>
 
@@ -522,6 +522,27 @@ Keep it up!</textarea>
   </div>
 
   <script>
+    const DEFAULT_FALLBACKS_TEXT = "Great stream today!\\nLoving the content so far!\\nKeep it up!";
+
+    const platformForms = {
+      youtube: {
+        target: "",
+        interval: 300,
+        mode: "gemini",
+        manual_message: "",
+        fallbacksText: DEFAULT_FALLBACKS_TEXT,
+      },
+      kick: {
+        target: "",
+        interval: 300,
+        mode: "gemini",
+        manual_message: "",
+        fallbacksText: DEFAULT_FALLBACKS_TEXT,
+      },
+    };
+
+    let activePlatform = "youtube";
+
     function getPlatform() {
       const checked = document.querySelector('input[name="platform"]:checked');
       return checked ? checked.value : "youtube";
@@ -530,6 +551,33 @@ Keep it up!</textarea>
     function getChatMode() {
       const checked = document.querySelector('input[name="chatMode"]:checked');
       return checked ? checked.value : "gemini";
+    }
+
+    function setChatModeRadio(mode) {
+      const targetVal = mode === "manual" ? "manual" : "gemini";
+      const radio = document.querySelector(`input[name="chatMode"][value="${targetVal}"]`);
+      if (radio) radio.checked = true;
+      applyModeState();
+    }
+
+    function saveCurrentFormToState(plat = activePlatform) {
+      platformForms[plat] = {
+        target: document.getElementById("targetInput").value,
+        interval: parseInt(document.getElementById("interval").value, 10) || 300,
+        mode: getChatMode(),
+        manual_message: document.getElementById("manualMsg").value,
+        fallbacksText: document.getElementById("fallbacks").value,
+      };
+    }
+
+    function loadStateIntoForm(plat) {
+      const st = platformForms[plat];
+      document.getElementById("targetInput").value = st.target || "";
+      document.getElementById("interval").value = st.interval || 300;
+      document.getElementById("manualMsg").value = st.manual_message || "";
+      document.getElementById("fallbacks").value =
+        typeof st.fallbacksText === "string" ? st.fallbacksText : DEFAULT_FALLBACKS_TEXT;
+      setChatModeRadio(st.mode || "gemini");
     }
 
     function applyModeState() {
@@ -577,44 +625,64 @@ Keep it up!</textarea>
 
     async function syncConfigLive(showToast = false) {
       const platform = getPlatform();
-      const mode = getChatMode();
-      const manual_message = document.getElementById("manualMsg").value;
-      const fallback_messages = document.getElementById("fallbacks").value
+      saveCurrentFormToState(platform);
+      const st = platformForms[platform];
+      const fallback_messages = st.fallbacksText
         .split("\\n").map(s => s.trim()).filter(Boolean);
 
       const res = await fetch("/config", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform, mode, manual_message, fallback_messages })
+        body: JSON.stringify({
+          platform,
+          mode: st.mode,
+          manual_message: st.manual_message,
+          fallback_messages,
+        })
       });
       if (showToast && res.ok) {
         refreshStatus();
       }
     }
 
+    function onFieldInput() {
+      saveCurrentFormToState(getPlatform());
+      syncConfigLive();
+    }
+
     function onModeChange() {
       applyModeState();
+      saveCurrentFormToState(getPlatform());
       syncConfigLive();
     }
 
     function onPlatformChange() {
-      applyPlatformTheme(getPlatform());
+      saveCurrentFormToState(activePlatform);
+      const nextPlatform = getPlatform();
+      activePlatform = nextPlatform;
+      applyPlatformTheme(nextPlatform);
+      loadStateIntoForm(nextPlatform);
       refreshStatus();
     }
 
     async function startAgent() {
       const platform = getPlatform();
-      const target = document.getElementById("targetInput").value.trim();
-      const interval = parseInt(document.getElementById("interval").value, 10) || 300;
-      const mode = getChatMode();
-      const manual_message = document.getElementById("manualMsg").value;
-      const fallback_messages = document.getElementById("fallbacks").value
+      saveCurrentFormToState(platform);
+      const st = platformForms[platform];
+      const fallback_messages = st.fallbacksText
         .split("\\n").map(s => s.trim()).filter(Boolean);
 
       const res = await fetch("/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform, target, interval, mode, manual_message, fallback_messages })
+        body: JSON.stringify({
+          platform,
+          target: st.target.trim(),
+          interval: st.interval,
+          mode: st.mode,
+          manual_message: st.manual_message,
+          fallback_messages,
+        })
       });
       const data = await res.json();
       if (!res.ok) alert(data.error || "Failed to start");
@@ -658,8 +726,13 @@ Keep it up!</textarea>
       logBox.scrollTop = logBox.scrollHeight;
     }
 
+    document.getElementById("targetInput").addEventListener("input", () => saveCurrentFormToState(getPlatform()));
+    document.getElementById("interval").addEventListener("input", () => saveCurrentFormToState(getPlatform()));
+    document.getElementById("manualMsg").addEventListener("input", onFieldInput);
+    document.getElementById("fallbacks").addEventListener("input", onFieldInput);
+
     applyPlatformTheme("youtube");
-    applyModeState();
+    loadStateIntoForm("youtube");
     refreshStatus();
     setInterval(refreshStatus, 2000);
   </script>
@@ -817,6 +890,7 @@ def status():
         "authenticated": has_token,
         "mode": cfg.get("mode", "gemini"),
         "manual_message": cfg.get("manual_message", ""),
+        "fallback_messages": cfg.get("fallbacks", ["Great stream today!", "Loving the content so far!", "Keep it up!"]),
         "logs": logs,
     })
 

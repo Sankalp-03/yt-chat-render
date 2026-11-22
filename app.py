@@ -48,9 +48,10 @@ if os.environ.get("FLASK_ENV") == "development":
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 state_lock = threading.Lock()
-session_logs = {}    # {(sid, platform): [log_lines...]}
-session_tokens = {}  # {(sid, platform): token_json_or_dict_str}
-agents = {}          # {(sid, platform): {"running": bool, "stop_event": Event, "thread": Thread}}
+session_logs = {}     # {(sid, platform): [log_lines...]}
+session_tokens = {}   # {(sid, platform): token_json_str}
+session_configs = {}  # {(sid, platform): {"mode": "gemini"|"manual", "manual_message": str, "fallbacks": list}}
+agents = {}           # {(sid, platform): {"running": bool, "stop_event": Event, "thread": Thread}}
 
 YT_VIDEO_PATTERNS = [
     r"(?:v=|/live/|/embed/|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})",
@@ -66,6 +67,11 @@ KICK_SLUG_PATTERNS = [
 def normalize_platform(raw):
     val = (raw or "youtube").strip().lower()
     return val if val in ("youtube", "kick") else "youtube"
+
+
+def normalize_mode(raw):
+    val = (raw or "gemini").strip().lower()
+    return val if val in ("gemini", "manual") else "gemini"
 
 
 def extract_yt_video_id(raw_value):
@@ -100,6 +106,11 @@ def get_or_create_sid():
     with state_lock:
         for plat in ("youtube", "kick"):
             session_logs.setdefault((sid, plat), [])
+            session_configs.setdefault((sid, plat), {
+                "mode": "gemini",
+                "manual_message": "",
+                "fallbacks": ["Great stream today!", "Loving the content so far!", "Keep it up!"],
+            })
     return sid
 
 
@@ -287,8 +298,8 @@ def send_kick_chat_message(access_token, broadcaster_user_id, text):
     return clean_text
 
 
-# --- Shared AI / Fallback Generator ---
-def generate_reply(recent_lines, fallbacks):
+# --- Message Selection (Checked Fresh Every Cycle) ---
+def generate_gemini_reply(recent_lines, fallbacks):
     pool = fallbacks if fallbacks else ["Great stream today!"]
     if not recent_lines or not gemini_client:
         return random.choice(pool)
@@ -323,8 +334,24 @@ def generate_reply(recent_lines, fallbacks):
         return random.choice(pool)
 
 
+def get_live_message_for_tick(sid, platform, recent_lines=None):
+    key = (sid, normalize_platform(platform))
+    with state_lock:
+        cfg = dict(session_configs.get(key, {}))
+    mode = normalize_mode(cfg.get("mode"))
+    fallbacks = cfg.get("fallbacks") or ["Great stream today!"]
+
+    if mode == "manual":
+        manual_text = " ".join((cfg.get("manual_message") or "").split()).strip()
+        if manual_text:
+            return manual_text
+        raise ValueError("Manual Chat selected, but Manual Chat Message is empty.")
+
+    return generate_gemini_reply(recent_lines or [], fallbacks)
+
+
 # --- Agent Loops ---
-def youtube_agent_loop(video_id, interval, fallbacks, token_json_str, sid, stop_evt):
+def youtube_agent_loop(video_id, interval, token_json_str, sid, stop_evt):
     try:
         add_log("Authenticating with session YouTube token...", sid, "youtube")
         yt = get_youtube_client(token_json_str, sid)
@@ -333,10 +360,12 @@ def youtube_agent_loop(video_id, interval, fallbacks, token_json_str, sid, stop_
 
         while not stop_evt.is_set():
             try:
-                recent = get_yt_recent_messages(yt, chat_id, limit=15)
-                msg = generate_reply(recent, fallbacks)
+                with state_lock:
+                    mode = normalize_mode(session_configs.get((sid, "youtube"), {}).get("mode"))
+                recent = get_yt_recent_messages(yt, chat_id, limit=15) if mode == "gemini" else []
+                msg = get_live_message_for_tick(sid, "youtube", recent_lines=recent)
                 sent_msg = send_yt_chat_message(yt, chat_id, msg)
-                add_log(f"[YT] Sent: {sent_msg}", sid, "youtube")
+                add_log(f"[YT | {mode}] Sent: {sent_msg}", sid, "youtube")
             except Exception as exc:
                 add_log(f"[YT] Loop error: {exc}", sid, "youtube")
 
@@ -352,7 +381,7 @@ def youtube_agent_loop(video_id, interval, fallbacks, token_json_str, sid, stop_
         add_log("[YT] Agent stopped.", sid, "youtube")
 
 
-def kick_agent_loop(slug, interval, fallbacks, token_json_str, sid, stop_evt):
+def kick_agent_loop(slug, interval, token_json_str, sid, stop_evt):
     try:
         add_log("Authenticating with session Kick token...", sid, "kick")
         access_token = get_kick_access_token(token_json_str, sid)
@@ -362,9 +391,11 @@ def kick_agent_loop(slug, interval, fallbacks, token_json_str, sid, stop_evt):
         while not stop_evt.is_set():
             try:
                 current_token = get_kick_access_token(token_json_str, sid)
-                msg = generate_reply([], fallbacks)
+                with state_lock:
+                    mode = normalize_mode(session_configs.get((sid, "kick"), {}).get("mode"))
+                msg = get_live_message_for_tick(sid, "kick", recent_lines=[])
                 sent_msg = send_kick_chat_message(current_token, broadcaster_id, msg)
-                add_log(f"[Kick] Sent to @{slug}: {sent_msg}", sid, "kick")
+                add_log(f"[Kick | {mode}] Sent to @{slug}: {sent_msg}", sid, "kick")
             except Exception as exc:
                 add_log(f"[Kick] Loop error: {exc}", sid, "kick")
 
@@ -393,7 +424,6 @@ HTML_PAGE = """
       --card: #1e293b;
       --border: #334155;
       --accent: #ef4444;
-      --accent-hover: #dc2626;
       --text: #e2e8f0;
       --muted: #94a3b8;
     }
@@ -402,28 +432,30 @@ HTML_PAGE = """
       --card: #111a13;
       --border: #1e3323;
       --accent: #53fc18;
-      --accent-hover: #42d90f;
       --text: #ecfdf5;
       --muted: #86efac;
     }
-    body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); max-width: 700px; margin: 36px auto; padding: 0 16px; transition: background 0.2s ease, color 0.2s ease; }
+    body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); max-width: 720px; margin: 36px auto; padding: 0 16px; transition: background 0.2s ease, color 0.2s ease; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 16px; }
     .header-top { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
-    .platform-switch { display: inline-flex; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 8px; padding: 4px; gap: 6px; }
-    .platform-switch label { margin: 0; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
-    .platform-switch input[type="radio"] { display: none; }
-    .platform-switch label.active-yt { background: #dc2626; color: #ffffff; }
-    .platform-switch label.active-kick { background: #53fc18; color: #052e16; }
+    .pill-group { display: inline-flex; background: rgba(0,0,0,0.35); border: 1px solid var(--border); border-radius: 8px; padding: 4px; gap: 6px; margin-top: 6px; }
+    .pill-group label { margin: 0; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 6px; }
+    .pill-group input[type="radio"] { display: none; }
+    .pill-group label.active-yt { background: #dc2626; color: #ffffff; }
+    .pill-group label.active-kick { background: #53fc18; color: #052e16; }
+    .pill-group label.active-mode { background: #2563eb; color: #ffffff; }
     label.field-label { display: block; font-size: 13px; color: var(--muted); margin-top: 12px; margin-bottom: 4px; }
     .hint { font-size: 12px; color: var(--muted); opacity: 0.9; margin-top: 5px; line-height: 1.4; }
     input, textarea { width: 100%; box-sizing: border-box; background: rgba(2,6,23,0.75); color: #f8fafc; border: 1px solid var(--border); border-radius: 6px; padding: 10px; font-size: 14px; }
-    textarea { min-height: 90px; resize: vertical; }
+    input:disabled, textarea:disabled { opacity: 0.45; cursor: not-allowed; }
+    textarea { min-height: 85px; resize: vertical; }
     .row { display: flex; gap: 10px; margin-top: 16px; align-items: center; flex-wrap: wrap; }
     button, a.btn { padding: 10px 16px; border-radius: 6px; border: none; font-weight: 600; cursor: pointer; text-decoration: none; font-size: 14px; display: inline-block; }
     .authBtn { background: var(--accent); color: #ffffff; }
     body.kick-mode .authBtn { color: #052e16; }
     #startBtn { background: #16a34a; color: white; }
     #stopBtn { background: #dc2626; color: white; }
+    #syncBtn { background: #334155; color: white; }
     .status { margin-left: auto; font-size: 13px; font-weight: 600; }
     .auth-badge { font-size: 12px; color: var(--muted); margin: 8px 0 10px 0; }
     pre { background: #020617; border: 1px solid var(--border); border-radius: 8px; padding: 12px; height: 220px; overflow-y: auto; font-size: 12px; color: #cbd5e1; margin: 0; }
@@ -433,7 +465,7 @@ HTML_PAGE = """
   <div class="card">
     <div class="header-top">
       <h2 id="pageTitle" style="margin: 0;">YouTube Live Chat Agent</h2>
-      <div class="platform-switch" role="radiogroup" aria-label="Select Platform">
+      <div class="pill-group" role="radiogroup" aria-label="Select Platform" style="margin-top: 0;">
         <label id="lblYt" class="active-yt">
           <input type="radio" name="platform" value="youtube" checked onchange="onPlatformChange()" />
           YouTube
@@ -452,17 +484,34 @@ HTML_PAGE = """
     <input id="targetInput" type="text" placeholder="Paste link from Share or browser, or enter Video ID" />
     <div id="targetHint" class="hint">Paste directly from the YouTube mobile app's <strong>Share</strong> button (<code>youtu.be/...</code> or <code>.../live/...</code>) or from your <strong>browser</strong> address bar (<code>youtube.com/watch?v=...</code>).</div>
 
+    <label class="field-label">Chat Message Source (checked before every message)</label>
+    <div class="pill-group" role="radiogroup" aria-label="Select Chat Message Mode">
+      <label id="lblModeGemini" class="active-mode">
+        <input type="radio" name="chatMode" value="gemini" checked onchange="onModeChange()" />
+        Gemini Chat
+      </label>
+      <label id="lblModeManual">
+        <input type="radio" name="chatMode" value="manual" onchange="onModeChange()" />
+        Manual Chat
+      </label>
+    </div>
+
+    <label class="field-label" for="manualMsg">Manual Chat Message</label>
+    <input id="manualMsg" type="text" placeholder="Type the exact message to send in Manual Chat mode" disabled oninput="syncConfigLive()" />
+    <div class="hint">Disabled when <strong>Gemini Chat</strong> is selected. When <strong>Manual Chat</strong> is selected, you can edit this text anytime and the next scheduled message will use the updated text.</div>
+
     <label class="field-label" for="interval">Interval (seconds)</label>
     <input id="interval" type="number" min="15" value="300" />
 
-    <label class="field-label" for="fallbacks">Fallback Messages (one per line)</label>
-    <textarea id="fallbacks">Great stream today!
+    <label class="field-label" for="fallbacks">Fallback Messages (used in Gemini Chat if chat is quiet or Gemini is unavailable)</label>
+    <textarea id="fallbacks" oninput="syncConfigLive()">Great stream today!
 Loving the content so far!
 Keep it up!</textarea>
 
     <div class="row">
       <button id="startBtn" onclick="startAgent()">Start</button>
       <button id="stopBtn" onclick="stopAgent()">Stop</button>
+      <button id="syncBtn" type="button" onclick="syncConfigLive(true)">Apply Message Now</button>
       <span id="statusText" class="status">Status: Stopped</span>
     </div>
   </div>
@@ -476,6 +525,19 @@ Keep it up!</textarea>
     function getPlatform() {
       const checked = document.querySelector('input[name="platform"]:checked');
       return checked ? checked.value : "youtube";
+    }
+
+    function getChatMode() {
+      const checked = document.querySelector('input[name="chatMode"]:checked');
+      return checked ? checked.value : "gemini";
+    }
+
+    function applyModeState() {
+      const mode = getChatMode();
+      const isManual = mode === "manual";
+      document.getElementById("lblModeGemini").classList.toggle("active-mode", !isManual);
+      document.getElementById("lblModeManual").classList.toggle("active-mode", isManual);
+      document.getElementById("manualMsg").disabled = !isManual;
     }
 
     function applyPlatformTheme(plat) {
@@ -513,6 +575,28 @@ Keep it up!</textarea>
         : "YouTube Activity Log";
     }
 
+    async function syncConfigLive(showToast = false) {
+      const platform = getPlatform();
+      const mode = getChatMode();
+      const manual_message = document.getElementById("manualMsg").value;
+      const fallback_messages = document.getElementById("fallbacks").value
+        .split("\\n").map(s => s.trim()).filter(Boolean);
+
+      const res = await fetch("/config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ platform, mode, manual_message, fallback_messages })
+      });
+      if (showToast && res.ok) {
+        refreshStatus();
+      }
+    }
+
+    function onModeChange() {
+      applyModeState();
+      syncConfigLive();
+    }
+
     function onPlatformChange() {
       applyPlatformTheme(getPlatform());
       refreshStatus();
@@ -522,13 +606,15 @@ Keep it up!</textarea>
       const platform = getPlatform();
       const target = document.getElementById("targetInput").value.trim();
       const interval = parseInt(document.getElementById("interval").value, 10) || 300;
+      const mode = getChatMode();
+      const manual_message = document.getElementById("manualMsg").value;
       const fallback_messages = document.getElementById("fallbacks").value
         .split("\\n").map(s => s.trim()).filter(Boolean);
 
       const res = await fetch("/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ platform, target, interval, fallback_messages })
+        body: JSON.stringify({ platform, target, interval, mode, manual_message, fallback_messages })
       });
       const data = await res.json();
       if (!res.ok) alert(data.error || "Failed to start");
@@ -573,6 +659,7 @@ Keep it up!</textarea>
     }
 
     applyPlatformTheme("youtube");
+    applyModeState();
     refreshStatus();
     setInterval(refreshStatus, 2000);
   </script>
@@ -690,7 +777,30 @@ def kick_oauth2callback():
     return redirect("/")
 
 
-# --- Status / Start / Stop ---
+# --- Live Config / Status / Start / Stop ---
+@app.route("/config", methods=["POST"])
+def update_config():
+    sid = get_or_create_sid()
+    payload = request.get_json(force=True) or {}
+    platform = normalize_platform(payload.get("platform"))
+    key = (sid, platform)
+
+    with state_lock:
+        cfg = session_configs.setdefault(key, {
+            "mode": "gemini",
+            "manual_message": "",
+            "fallbacks": ["Great stream today!", "Loving the content so far!", "Keep it up!"],
+        })
+        if "mode" in payload:
+            cfg["mode"] = normalize_mode(payload.get("mode"))
+        if "manual_message" in payload:
+            cfg["manual_message"] = payload.get("manual_message") or ""
+        if "fallback_messages" in payload and isinstance(payload.get("fallback_messages"), list):
+            cfg["fallbacks"] = payload.get("fallback_messages")
+
+    return jsonify({"ok": True, "mode": cfg["mode"]})
+
+
 @app.route("/status")
 def status():
     sid = get_or_create_sid()
@@ -700,10 +810,13 @@ def status():
         has_token = bool(session_tokens.get(key))
         running = bool(agents.get(key, {}).get("running", False))
         logs = list(session_logs.get(key, []))
+        cfg = dict(session_configs.get(key, {}))
     return jsonify({
         "platform": platform,
         "running": running,
         "authenticated": has_token,
+        "mode": cfg.get("mode", "gemini"),
+        "manual_message": cfg.get("manual_message", ""),
         "logs": logs,
     })
 
@@ -715,10 +828,14 @@ def start():
     platform = normalize_platform(payload.get("platform"))
     raw_target = (payload.get("target") or payload.get("video_id") or "").strip()
     interval = int(payload.get("interval") or 300)
+    mode = normalize_mode(payload.get("mode"))
+    manual_message = payload.get("manual_message") or ""
     fallbacks = payload.get("fallback_messages") or []
 
     if not raw_target:
         return jsonify({"error": "Stream link, channel link, or ID is required."}), 400
+    if mode == "manual" and not manual_message.strip():
+        return jsonify({"error": "Please enter a Manual Chat Message when Manual Chat is selected."}), 400
 
     key = (sid, platform)
 
@@ -736,11 +853,16 @@ def start():
         if agents.get(key, {}).get("running", False):
             return jsonify({"error": f"{platform.capitalize()} agent is already running for this session."}), 400
 
+        session_configs[key] = {
+            "mode": mode,
+            "manual_message": manual_message,
+            "fallbacks": fallbacks,
+        }
         session_logs[key] = []
         stop_evt = threading.Event()
         thread = threading.Thread(
             target=loop_fn,
-            args=(target_id, interval, fallbacks, token_json, sid, stop_evt),
+            args=(target_id, interval, token_json, sid, stop_evt),
             daemon=True,
         )
         agents[key] = {

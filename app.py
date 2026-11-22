@@ -24,7 +24,6 @@ MODEL_ID = "gemini-3.5-flash-lite"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 CLIENT_CONFIG_JSON = os.environ.get("GOOGLE_CLIENT_CONFIG_JSON", "")
 
-# Allow http only when testing locally on localhost
 if os.environ.get("FLASK_ENV") == "development":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
     app.config["SESSION_COOKIE_SECURE"] = False
@@ -32,22 +31,9 @@ if os.environ.get("FLASK_ENV") == "development":
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 state_lock = threading.Lock()
-stop_event = threading.Event()
-worker_thread = None
-
-session_logs = {}  # {session_id: [log_lines...]}
-active_session_id = None
-
-agent_state = {
-    "running": False,
-    "video_id": "",
-    "interval": 300,
-    "fallback_messages": [
-        "Great stream today!",
-        "Loving the content so far!",
-        "Keep it up!",
-    ],
-}
+session_logs = {}  # {sid: [log_lines...]}
+session_tokens = {}  # {sid: token_json_str}
+agents = {}  # {sid: {"running": bool, "stop_event": Event, "thread": Thread}}
 
 
 def get_or_create_sid():
@@ -60,15 +46,13 @@ def get_or_create_sid():
     return sid
 
 
-def add_log(msg, sid=None):
+def add_log(msg, sid):
     stamp = time.strftime("%H:%M:%S")
     line = f"[{stamp}] {msg}"
     with state_lock:
-        target_sid = sid or active_session_id
-        if target_sid:
-            session_logs.setdefault(target_sid, [])
-            session_logs[target_sid].append(line)
-            session_logs[target_sid] = session_logs[target_sid][-100:]
+        session_logs.setdefault(sid, [])
+        session_logs[sid].append(line)
+        session_logs[sid] = session_logs[sid][-100:]
 
 
 def url_for_callback():
@@ -93,7 +77,7 @@ def build_oauth_flow(state=None):
     )
 
 
-def get_youtube_client(token_json_str, sid=None):
+def get_youtube_client(token_json_str, sid):
     if not token_json_str:
         raise RuntimeError("Not authenticated. Click 'Authenticate / Re-auth Google' first.")
     token_data = json.loads(token_json_str)
@@ -102,9 +86,7 @@ def get_youtube_client(token_json_str, sid=None):
         creds.refresh(Request())
         refreshed_json = creds.to_json()
         with state_lock:
-            if sid:
-                session_logs.setdefault(sid, [])
-        session["youtube_token_json"] = refreshed_json
+            session_tokens[sid] = refreshed_json
     return googleapiclient.discovery.build("youtube", "v3", credentials=creds)
 
 
@@ -150,26 +132,29 @@ def generate_reply(recent_lines, fallbacks):
         + "\n".join(recent_lines)
         + "\n\nWrite one short, natural chat message that fits the conversation."
     )
-    response = gemini_client.models.generate_content(
-        model=MODEL_ID,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=(
-                "You are a casual live stream viewer. "
-                "Reply in 1 short line under 12 words. "
-                "No markdown, no hashtags, never mention AI or bots. "
-                "Output only the message text."
+    try:
+        response = gemini_client.models.generate_content(
+            model=MODEL_ID,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=(
+                    "You are a casual live stream viewer. "
+                    "Reply in 1 short line under 12 words. "
+                    "No markdown, no hashtags, never mention AI or bots. "
+                    "Output only the message text."
+                ),
+                max_output_tokens=40,
+                temperature=0.8,
             ),
-            max_output_tokens=40,
-            temperature=0.8,
-        ),
-    )
-    lines = [
-        line.strip().strip('"').strip("'")
-        for line in (response.text or "").splitlines()
-        if line.strip()
-    ]
-    return lines[0] if lines else random.choice(pool)
+        )
+        lines = [
+            line.strip().strip('"').strip("'")
+            for line in (response.text or "").splitlines()
+            if line.strip()
+        ]
+        return lines[0] if lines else random.choice(pool)
+    except Exception:
+        return random.choice(pool)
 
 
 def send_chat_message(youtube, live_chat_id, text):
@@ -185,31 +170,32 @@ def send_chat_message(youtube, live_chat_id, text):
     ).execute()
 
 
-def agent_loop(video_id, interval, fallbacks, token_json_str, sid):
+def agent_loop(video_id, interval, fallbacks, token_json_str, sid, stop_evt):
     try:
-        add_log("Authenticating with session YouTube token...", sid=sid)
-        yt = get_youtube_client(token_json_str, sid=sid)
+        add_log("Authenticating with session YouTube token...", sid)
+        yt = get_youtube_client(token_json_str, sid)
         chat_id = get_live_chat_id(yt, video_id)
-        add_log(f"Connected to chat: {chat_id}", sid=sid)
+        add_log(f"Connected to chat: {chat_id}", sid)
 
-        while not stop_event.is_set():
+        while not stop_evt.is_set():
             try:
                 recent = get_recent_messages(yt, chat_id, limit=15)
                 msg = generate_reply(recent, fallbacks)
                 send_chat_message(yt, chat_id, msg)
-                add_log(f"Sent: {msg}", sid=sid)
+                add_log(f"Sent: {msg}", sid)
             except Exception as exc:
-                add_log(f"Loop error: {exc}", sid=sid)
+                add_log(f"Loop error: {exc}", sid)
 
             wait_seconds = max(15, int(interval)) + random.randint(0, 20)
-            if stop_event.wait(timeout=wait_seconds):
+            if stop_evt.wait(timeout=wait_seconds):
                 break
     except Exception as exc:
-        add_log(f"Startup error: {exc}", sid=sid)
+        add_log(f"Startup error: {exc}", sid)
     finally:
         with state_lock:
-            agent_state["running"] = False
-        add_log("Agent stopped.", sid=sid)
+            if sid in agents:
+                agents[sid]["running"] = False
+        add_log("Agent stopped.", sid)
 
 
 HTML_PAGE = """
@@ -345,18 +331,21 @@ def oauth2callback():
 
     flow.fetch_token(authorization_response=auth_response)
     creds = flow.credentials
-    session["youtube_token_json"] = creds.to_json()
+    token_json = creds.to_json()
+
+    with state_lock:
+        session_tokens[sid] = token_json
     session.pop("code_verifier", None)
-    add_log("Generated new session youtube_token_json via Google OAuth.", sid=sid)
+    add_log("Generated new session youtube_token_json via Google OAuth.", sid)
     return redirect("/")
 
 
 @app.route("/status")
 def status():
     sid = get_or_create_sid()
-    has_token = bool(session.get("youtube_token_json"))
     with state_lock:
-        running = agent_state["running"]
+        has_token = bool(session_tokens.get(sid))
+        running = bool(agents.get(sid, {}).get("running", False))
         logs = list(session_logs.get(sid, []))
     return jsonify({
         "running": running,
@@ -367,12 +356,7 @@ def status():
 
 @app.route("/start", methods=["POST"])
 def start():
-    global worker_thread, active_session_id
     sid = get_or_create_sid()
-    token_json = session.get("youtube_token_json", "")
-    if not token_json:
-        return jsonify({"error": "Please click 'Authenticate / Re-auth Google' first."}), 400
-
     payload = request.get_json(force=True) or {}
     video_id = (payload.get("video_id") or "").strip()
     interval = int(payload.get("interval") or 300)
@@ -382,30 +366,37 @@ def start():
         return jsonify({"error": "YouTube Video ID is required."}), 400
 
     with state_lock:
-        if agent_state["running"]:
-            return jsonify({"error": "Agent is already running."}), 400
-        active_session_id = sid
-        session_logs[sid] = []
-        agent_state["video_id"] = video_id
-        agent_state["interval"] = interval
-        agent_state["fallback_messages"] = fallbacks
-        agent_state["running"] = True
-        stop_event.clear()
+        token_json = session_tokens.get(sid, "")
+        if not token_json:
+            return jsonify({"error": "Please click 'Authenticate / Re-auth Google' first."}), 400
+        if agents.get(sid, {}).get("running", False):
+            return jsonify({"error": "Agent is already running for this session."}), 400
 
-    worker_thread = threading.Thread(
-        target=agent_loop,
-        args=(video_id, interval, fallbacks, token_json, sid),
-        daemon=True,
-    )
-    worker_thread.start()
+        session_logs[sid] = []
+        stop_evt = threading.Event()
+        thread = threading.Thread(
+            target=agent_loop,
+            args=(video_id, interval, fallbacks, token_json, sid, stop_evt),
+            daemon=True,
+        )
+        agents[sid] = {
+            "running": True,
+            "stop_event": stop_evt,
+            "thread": thread,
+        }
+
+    thread.start()
     return jsonify({"ok": True})
 
 
 @app.route("/stop", methods=["POST"])
 def stop():
     sid = get_or_create_sid()
-    stop_event.set()
-    add_log("Stop requested...", sid=sid)
+    with state_lock:
+        agent_info = agents.get(sid)
+        if agent_info:
+            agent_info["stop_event"].set()
+    add_log("Stop requested...", sid)
     return jsonify({"ok": True})
 
 

@@ -481,7 +481,7 @@ HTML_PAGE = """
     <a id="authLink" class="btn authBtn" href="/auth">Authenticate / Re-auth Google</a>
 
     <label id="targetLabel" class="field-label" for="targetInput">YouTube Stream Link or Video ID</label>
-    <input id="targetInput" type="text" placeholder="Paste link from Share or browser, or enter Video ID" />
+    <input id="targetInput" type="text" autocomplete="off" placeholder="Paste link from Share or browser, or enter Video ID" />
     <div id="targetHint" class="hint">Paste directly from the YouTube mobile app's <strong>Share</strong> button (<code>youtu.be/...</code> or <code>.../live/...</code>) or from your <strong>browser</strong> address bar (<code>youtube.com/watch?v=...</code>).</div>
 
     <label class="field-label">Chat Message Source (checked before every message)</label>
@@ -497,7 +497,7 @@ HTML_PAGE = """
     </div>
 
     <label class="field-label" for="manualMsg">Manual Chat Message</label>
-    <input id="manualMsg" type="text" placeholder="Type the exact message to send in Manual Chat mode" disabled />
+    <input id="manualMsg" type="text" autocomplete="off" placeholder="Type the exact message to send in Manual Chat mode" disabled />
     <div class="hint">Disabled when <strong>Gemini Chat</strong> is selected. When <strong>Manual Chat</strong> is selected, you can edit this text anytime and the next scheduled message will use the updated text.</div>
 
     <label class="field-label" for="interval">Interval (seconds)</label>
@@ -523,25 +523,58 @@ Keep it up!</textarea>
 
   <script>
     const DEFAULT_FALLBACKS_TEXT = "Great stream today!\\nLoving the content so far!\\nKeep it up!";
+    const STORAGE_KEY = "yt_kick_platform_forms_v1";
+    const PLATFORM_STORAGE_KEY = "yt_kick_active_platform_v1";
 
-    const platformForms = {
-      youtube: {
-        target: "",
-        interval: 300,
-        mode: "gemini",
-        manual_message: "",
-        fallbacksText: DEFAULT_FALLBACKS_TEXT,
-      },
-      kick: {
-        target: "",
-        interval: 300,
-        mode: "gemini",
-        manual_message: "",
-        fallbacksText: DEFAULT_FALLBACKS_TEXT,
-      },
-    };
+    function createDefaultForms() {
+      return {
+        youtube: {
+          target: "",
+          interval: 300,
+          mode: "gemini",
+          manual_message: "",
+          fallbacksText: DEFAULT_FALLBACKS_TEXT,
+        },
+        kick: {
+          target: "",
+          interval: 300,
+          mode: "gemini",
+          manual_message: "",
+          fallbacksText: DEFAULT_FALLBACKS_TEXT,
+        },
+      };
+    }
 
-    let activePlatform = "youtube";
+    function loadSavedForms() {
+      const base = createDefaultForms();
+      try {
+        const raw = sessionStorage.getItem(STORAGE_KEY);
+        if (!raw) return base;
+        const parsed = JSON.parse(raw);
+        for (const plat of ["youtube", "kick"]) {
+          if (parsed && typeof parsed[plat] === "object" && parsed[plat] !== null) {
+            base[plat] = {
+              target: typeof parsed[plat].target === "string" ? parsed[plat].target : "",
+              interval: Number(parsed[plat].interval) || 300,
+              mode: parsed[plat].mode === "manual" ? "manual" : "gemini",
+              manual_message: typeof parsed[plat].manual_message === "string" ? parsed[plat].manual_message : "",
+              fallbacksText: typeof parsed[plat].fallbacksText === "string" ? parsed[plat].fallbacksText : DEFAULT_FALLBACKS_TEXT,
+            };
+          }
+        }
+      } catch (_) {}
+      return base;
+    }
+
+    const platformForms = loadSavedForms();
+    let activePlatform = sessionStorage.getItem(PLATFORM_STORAGE_KEY) === "kick" ? "kick" : "youtube";
+
+    function persistForms() {
+      try {
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(platformForms));
+        sessionStorage.setItem(PLATFORM_STORAGE_KEY, activePlatform);
+      } catch (_) {}
+    }
 
     function getPlatform() {
       const checked = document.querySelector('input[name="platform"]:checked');
@@ -568,6 +601,7 @@ Keep it up!</textarea>
         manual_message: document.getElementById("manualMsg").value,
         fallbacksText: document.getElementById("fallbacks").value,
       };
+      persistForms();
     }
 
     function loadStateIntoForm(plat) {
@@ -660,6 +694,7 @@ Keep it up!</textarea>
       saveCurrentFormToState(activePlatform);
       const nextPlatform = getPlatform();
       activePlatform = nextPlatform;
+      persistForms();
       applyPlatformTheme(nextPlatform);
       loadStateIntoForm(nextPlatform);
       refreshStatus();
@@ -731,8 +766,11 @@ Keep it up!</textarea>
     document.getElementById("manualMsg").addEventListener("input", onFieldInput);
     document.getElementById("fallbacks").addEventListener("input", onFieldInput);
 
-    applyPlatformTheme("youtube");
-    loadStateIntoForm("youtube");
+    const initialRadio = document.querySelector(`input[name="platform"][value="${activePlatform}"]`);
+    if (initialRadio) initialRadio.checked = true;
+
+    applyPlatformTheme(activePlatform);
+    loadStateIntoForm(activePlatform);
     refreshStatus();
     setInterval(refreshStatus, 2000);
   </script>

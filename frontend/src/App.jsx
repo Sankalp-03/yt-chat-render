@@ -113,8 +113,8 @@ function App() {
   };
 
   const sentCount = useMemo(
-    () => (status.logs || []).filter((line) => line.includes("Sent:")).length,
-    [status.logs]
+    () => (status.logs || []).filter((line) => /Sent to/i.test(line)).length,
+    [status.logs],
   );
   const logLines = status.logs || [];
 

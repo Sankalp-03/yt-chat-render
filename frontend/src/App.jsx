@@ -123,7 +123,7 @@ function App() {
       <aside className="sidebar">
         <div className="brand">
           <div className="brand-mark"><Radio size={20} /></div>
-          <div><strong>StreamPilot</strong><span>CHAT AUTOMATION</span></div>
+          <div><strong>StreamHelm</strong><span>CHAT AUTOMATION</span></div>
         </div>
         <div className="workspace-label">WORKSPACE</div>
         <button className="nav-item active"><LayoutDashboard size={17} /> Dashboard</button>
@@ -301,7 +301,7 @@ function App() {
               </section>
             </div>
           </div>
-          <footer className="page-footer"><span>StreamPilot <span className="footer-separator">/</span> YouTube & Kick live chat automation</span><span>Built for your stream workflow</span></footer>
+          <footer className="page-footer"><span>StreamHelm <span className="footer-separator">/</span> YouTube & Kick live chat automation</span><span>Built for your stream workflow</span></footer>
         </div>
       </main>
       {toast && <div className={`toast ${toast.type}`}><span>{toast.type === "error" ? <AlertCircle size={17} /> : <Check size={17} />}</span>{toast.message}<button onClick={() => setToast(null)}>×</button></div>}

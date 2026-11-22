@@ -304,6 +304,7 @@ def auth():
         prompt="consent",
     )
     session["oauth_state"] = state
+    session["code_verifier"] = flow.code_verifier
     return redirect(auth_url)
 
 
@@ -311,13 +312,20 @@ def auth():
 def oauth2callback():
     state = session.get("oauth_state")
     flow = build_oauth_flow(state=state)
-    flow.fetch_token(authorization_response=request.url)
+    flow.code_verifier = session.get("code_verifier")
+
+    auth_response = request.url
+    if "onrender.com" in auth_response and auth_response.startswith("http://"):
+        auth_response = "https://" + auth_response[len("http://"):]
+
+    flow.fetch_token(authorization_response=auth_response)
     creds = flow.credentials
     token_json = creds.to_json()
 
     with state_lock:
         agent_state["youtube_token_json"] = token_json
     session["youtube_token_json"] = token_json
+    session.pop("code_verifier", None)
     add_log("Generated new dynamic youtube_token_json via Google OAuth.")
     return redirect("/")
 

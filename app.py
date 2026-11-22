@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import uuid
 import time
@@ -24,6 +25,7 @@ MODEL_ID = "gemini-3.5-flash-lite"
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 CLIENT_CONFIG_JSON = os.environ.get("GOOGLE_CLIENT_CONFIG_JSON", "")
 
+# Allow http only when testing locally on localhost
 if os.environ.get("FLASK_ENV") == "development":
     os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
     app.config["SESSION_COOKIE_SECURE"] = False
@@ -34,6 +36,22 @@ state_lock = threading.Lock()
 session_logs = {}  # {sid: [log_lines...]}
 session_tokens = {}  # {sid: token_json_str}
 agents = {}  # {sid: {"running": bool, "stop_event": Event, "thread": Thread}}
+
+VIDEO_ID_PATTERNS = [
+    r"(?:v=|/live/|/embed/|/shorts/|youtu\.be/)([A-Za-z0-9_-]{11})",
+    r"^([A-Za-z0-9_-]{11})$",
+]
+
+
+def extract_video_id(raw_value):
+    val = (raw_value or "").strip()
+    if not val:
+        return ""
+    for pattern in VIDEO_ID_PATTERNS:
+        match = re.search(pattern, val)
+        if match:
+            return match.group(1)
+    return val
 
 
 def get_or_create_sid():
@@ -158,13 +176,18 @@ def generate_reply(recent_lines, fallbacks):
 
 
 def send_chat_message(youtube, live_chat_id, text):
+    clean_text = " ".join((text or "").split()).strip()
+    if not clean_text:
+        clean_text = "Great stream today!"
+    clean_text = clean_text[:200]
+
     youtube.liveChatMessages().insert(
         part="snippet",
         body={
             "snippet": {
                 "liveChatId": live_chat_id,
                 "type": "textMessageEvent",
-                "textMessageDetails": {"messageText": text},
+                "textMessageDetails": {"messageText": clean_text},
             }
         },
     ).execute()
@@ -209,6 +232,7 @@ HTML_PAGE = """
     body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; max-width: 680px; margin: 40px auto; padding: 0 16px; }
     .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 20px; margin-bottom: 16px; }
     label { display: block; font-size: 13px; color: #94a3b8; margin-top: 12px; margin-bottom: 4px; }
+    .hint { font-size: 12px; color: #94a3b8; margin-top: 5px; }
     input, textarea { width: 100%; box-sizing: border-box; background: #0f172a; color: #f8fafc; border: 1px solid #475569; border-radius: 6px; padding: 10px; font-size: 14px; }
     textarea { min-height: 90px; resize: vertical; }
     .row { display: flex; gap: 10px; margin-top: 16px; align-items: center; flex-wrap: wrap; }
@@ -227,8 +251,9 @@ HTML_PAGE = """
     <div id="authBadge" class="auth-badge">YouTube Auth: Checking...</div>
     <a class="btn authBtn" href="/auth">Authenticate / Re-auth Google</a>
 
-    <label for="videoId">YouTube Video ID</label>
-    <input id="videoId" type="text" placeholder="e.g. Ysc9P6jAOfk" />
+    <label for="videoId">YouTube Stream Link or Video ID</label>
+    <input id="videoId" type="text" placeholder="Paste link from Share or browser, or enter Video ID" />
+    <div class="hint">Paste directly from the YouTube mobile app's <strong>Share</strong> button (<code>youtu.be/...</code> or <code>.../live/...</code>) or from your <strong>browser</strong> address bar (<code>youtube.com/watch?v=...</code>).</div>
 
     <label for="interval">Interval (seconds)</label>
     <input id="interval" type="number" min="15" value="300" />
@@ -358,12 +383,12 @@ def status():
 def start():
     sid = get_or_create_sid()
     payload = request.get_json(force=True) or {}
-    video_id = (payload.get("video_id") or "").strip()
+    video_id = extract_video_id(payload.get("video_id"))
     interval = int(payload.get("interval") or 300)
     fallbacks = payload.get("fallback_messages") or []
 
     if not video_id:
-        return jsonify({"error": "YouTube Video ID is required."}), 400
+        return jsonify({"error": "YouTube Stream Link or Video ID is required."}), 400
 
     with state_lock:
         token_json = session_tokens.get(sid, "")
